@@ -29,7 +29,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from tqdm import tqdm
 import json
 
-from model import GPTConfig, GPT
+from model import GPTConfig, StitchableGPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -39,6 +39,8 @@ resume_dir = 'out'
 merge_dir = 'out'
 # load merge weights from weights.json
 merge_weights = json.load(open('merge_weights_char.json'))
+
+stitch_layer_index = 5
 
 eval_interval = 2000
 log_interval = 1
@@ -79,7 +81,6 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
-backward = False
 
 # -----------------------------------------------------------------------------
 # debug
@@ -175,16 +176,13 @@ data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-def get_batch(split, backward):
+def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
 
-    if backward:
-        x = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    else:
-        x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
 
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
@@ -213,7 +211,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, backward=backward) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, stitching=(init_from == "stitch"), stitching_layer=stitch_layer_index) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -222,7 +220,7 @@ if init_from == 'scratch':
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = StitchableGPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {resume_dir}")
     # resume training from a checkpoint.
@@ -235,7 +233,7 @@ elif init_from == 'resume':
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = StitchableGPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -246,6 +244,7 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+
 elif init_from == 'merge':
     print(f"Merging model {resume_dir} with {merge_dir}")
     # resume training from a checkpoint.
@@ -262,7 +261,7 @@ elif init_from == 'merge':
         assert checkpoint_model_args[k] == merge_model_args[k], f"model args {k} mismatch"
     # create the model
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = StitchableGPT(gptconf)
     state_dict = checkpoint['model']
     merge_state_dict = merge_model_checkpoint['model']
    
@@ -291,11 +290,81 @@ elif init_from == 'merge':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+
+elif init_from == 'stitch':
+    print(f"Stitching model {resume_dir} with {merge_dir}")
+    # resume training from a checkpoint.
+    ckpt_path = os.path.join(resume_dir, 'ckpt.pt')
+    model_to_merge_path = os.path.join(merge_dir, 'ckpt.pt')
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint_model_args = checkpoint['model_args']
+    merge_model_checkpoint = torch.load(model_to_merge_path, map_location=device)
+    merge_model_args = merge_model_checkpoint['model_args']
+    # force these config attributes to be equal otherwise we can't even resume training
+    # the rest of the attributes (e.g. dropout) can stay as desired from command line
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = checkpoint_model_args[k]
+        assert checkpoint_model_args[k] == merge_model_args[k], f"model args {k} mismatch"
+    # create the model
+    gptconf = GPTConfig(**model_args)
+    model = StitchableGPT(gptconf).to(device=device)
+    state_dict = checkpoint['model']
+    merge_state_dict = merge_model_checkpoint['model']
+   
+    # fix the keys of the state dictionary
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
+    # fix the keys of the merge state dictionary
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(merge_state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            merge_state_dict[k[len(unwanted_prefix):]] = merge_state_dict.pop(k)
+
+    # to stitch the models, we need to first get the embeddings from each model
+    # and then stitch the models together
+    # load the first model
+    model.load_state_dict(state_dict, strict=False)
+
+    # get first batch of data
+    X, _ = get_batch('train')
+
+    # get the embeddings from the first model
+    x_source = model.extract_features(X, stitch_layer_index)
+
+    # load the second model
+    model.load_state_dict(merge_state_dict, strict=False)
+
+    # get the embeddings from the second model
+    x_target = model.extract_features(X, stitch_layer_index)
+
+    # stitch the model weights based on stitch_layer_index
+    # transformer.h.i.ln_1.weight -> get number i and compare to stitch_layer_index
+    for k,v in list(state_dict.items()):
+        if k.startswith('transformer.h'):
+            # get the layer number
+            layer_num = int(k.split('.')[2])
+            if layer_num >= stitch_layer_index:
+                # stitch the weights
+                state_dict[k] = merge_state_dict[k]
+            print(f"Copying layer {k} from second model: {layer_num >= stitch_layer_index}")
+
+    # free up some memory
+    del merge_state_dict
+    del merge_model_checkpoint
+
+    model.load_state_dict(state_dict, strict=False)
+
+    # initialize the stitching layer
+    model.init_stitching(x_source, x_target)
+
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
+    model = StitchableGPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
@@ -332,7 +401,7 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split, backward)
+            X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
@@ -355,7 +424,7 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 # training loop
-X, Y = get_batch('train', backward) # fetch the very first batch
+X, Y = get_batch('train') # fetch the very first batch
 # for tok in X[0].tolist():
 #     print("{}: {}".format(tok, tiktoken.get_encoding("gpt2").decode([tok,])))
 #     break
@@ -411,7 +480,7 @@ for local_iter_num in tqdm(range(iter_num, max_iters)): # breaks for distributed
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train', backward)
+        X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient

@@ -61,6 +61,74 @@ def top_p_filtering(
 
     return logits
 
+#
+def rearrange_activations(activations):
+    n_channels = activations.shape[-1]
+    activations = activations.reshape(-1, n_channels)
+    return activations
+
+def ps_inv(x1, x2):
+    '''Least-squares solver given feature maps from two anchors.
+    
+    Source: https://github.com/renyi-ai/drfrankenstein/blob/main/src/comparators/compare_functions/ps_inv.py
+    '''
+    x1 = rearrange_activations(x1)
+    x2 = rearrange_activations(x2)
+
+    if not x1.shape[0] == x2.shape[0]:
+        raise ValueError('Spatial size of compared neurons must match when ' \
+                         'calculating psuedo inverse matrix.')
+
+    # Get transformation matrix shape
+    shape = list(x1.shape)
+    shape[-1] += 1
+
+    # Calculate pseudo inverse
+    x1_ones = torch.ones(shape)
+    x1_ones[:, :-1] = x1
+    A_ones = torch.matmul(torch.linalg.pinv(x1_ones), x2.to(x1_ones.device)).T
+
+    # Get weights and bias
+    w = A_ones[..., :-1]
+    b = A_ones[..., -1]
+
+    return w, b
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    stitching: bool = False # stitching layer
+    stitching_layer: int = 0 # layer to stitch
+    stitch_bias: bool = True # bias in stitching layer
+    freeze_non_stitching: bool = True # freeze non-stitching layers
+
+class StitchingLayer(nn.Module):
+    """Stitching layer for the Frankenstein model"""
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.config = config
+        self.stitching = nn.Linear(config.n_embd, config.n_embd, bias=config.stitch_bias)
+
+    def forward(self, x):
+        x = self.stitching(x)
+        return x
+    
+    def init_layer(self, x_source, x_target):
+        """Initialize stitching layer with pseudo inverse"""
+        print("Initializing stitching layer with pseudo inverse")
+
+        w, b = ps_inv(x_source, x_target)
+
+        self.stitching.weight.data.copy_(w)
+        self.stitching.bias.data.copy_(b)
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -152,28 +220,15 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+    
 
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    backward: bool = False # backward generation
+class StitchableGPT(nn.Module):
 
-class GPT(nn.Module):
-
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-
-        if self.config.backward:
-            print("\nINFO: Using backward generation\n")
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -182,6 +237,11 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+
+        # stitching layer
+        if(self.config.stitching):
+            self.transformer['stitching'] = StitchingLayer(config)
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -198,6 +258,29 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def init_stitching(self, x_source, x_target):
+        """Initialize stitching layer with pseudo inverse"""
+        self.transformer['stitching'].init_layer(x_source, x_target)
+        if(self.config.freeze_non_stitching):
+            print("Freezing non-stitching layers")
+            for param in self.transformer.parameters():
+                param.requires_grad = False
+            for param in self.transformer['stitching'].parameters():
+                param.requires_grad = True
+
+    def extract_features(self, x, block_idx):
+        """Extract features from the model at the specified block index"""
+        x_e = self.transformer.wte(x)
+        x_pos = self.transformer.wpe(x)
+        x = self.transformer.drop(x_e + x_pos)
+        for i, block in enumerate(self.transformer.h):
+            if(self.config.stitching and i == self.config.stitching_layer):
+                x = self.transformer.stitching(x)
+            x = block(x)
+            if i == block_idx:
+                return x
+        return x
 
     def get_num_params(self, non_embedding=True):
         """
@@ -225,33 +308,23 @@ class GPT(nn.Module):
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
-        if(self.config.backward):
-            # backward models train on reversed sequences
-            idx = torch.flip(idx, [1])
-
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        for (i, block) in enumerate(self.transformer.h):
+            if(self.config.stitching and i == self.config.stitching_layer):
+                x = self.transformer.stitching(x)
             x = block(x)
         x = self.transformer.ln_f(x)
-
-        if(self.config.backward):
-            # backward models train on reversed sequences
-            # so we need to flip the output embeddings
-            x = torch.flip(x, [1])
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position (first position for backward models)
-            if(self.config.backward):
-                logits = self.lm_head(x[:, [0], :])
-            else:
-                logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
@@ -293,7 +366,7 @@ class GPT(nn.Module):
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
-        model = GPT(config)
+        model = StitchableGPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
@@ -375,10 +448,10 @@ class GPT(nn.Module):
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
         # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
-        use_fused = False#(device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters) # False
         print(f"using fused AdamW: {use_fused}")
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.SGD(optim_groups, lr=learning_rate, momentum=0.9, **extra_args) #torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer =  torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args) # torch.optim.SGD(optim_groups, lr=learning_rate, momentum=0.9, **extra_args)
 
         return optimizer
 
@@ -409,19 +482,13 @@ class GPT(nn.Module):
         import os
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
-            if(self.config.backward):
-                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, :self.config.block_size]
-            else:
-                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
 
-            if (self.config.backward):
-                logits = logits[:, 0, :] / temperature
-            else:
-                # pluck the logits at the final step and scale by desired temperature
-                logits = logits[:, -1, :] / temperature
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
             
             # optionally crop the logits to only the top k options
             if top_k is not None:
@@ -435,12 +502,8 @@ class GPT(nn.Module):
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
 
-            if(self.config.backward):
-                # append sampled index to the running sequence and continue
-                idx = torch.cat((idx_next, idx), dim=1)
-            else:
-                # append sampled index to the running sequence and continue
-                idx = torch.cat((idx, idx_next), dim=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
 
             #os.system('clear')
             #print(decode(idx[0].tolist()))

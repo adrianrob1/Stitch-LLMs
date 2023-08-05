@@ -10,3 +10,4 @@ out-shakespeare-char-orig
 wandb
 out*
 checkpoints.tar.xz
+stitched*
