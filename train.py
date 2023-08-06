@@ -41,6 +41,7 @@ merge_dir = 'out'
 merge_weights = json.load(open('merge_weights_char.json'))
 
 stitch_layer_index = 5
+use_original_head = False
 
 eval_interval = 2000
 log_interval = 1
@@ -211,7 +212,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, stitching=(init_from == "stitch"), stitching_layer=stitch_layer_index) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, stitching=(init_from == "stitch"), stitching_layer=stitch_layer_index, use_original_head=use_original_head) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -350,6 +351,10 @@ elif init_from == 'stitch':
                 # stitch the weights
                 state_dict[k] = merge_state_dict[k]
             print(f"Copying layer {k} from second model: {layer_num >= stitch_layer_index}")
+        elif (k.startswith('transformer.ln_f') or k.startswith('lm_head')) and not gptconf.use_original_head:
+            # copy the final layer weights
+            state_dict[k] = merge_state_dict[k]
+            print(f"Copying layer {k} from second model")
 
     # free up some memory
     del merge_state_dict

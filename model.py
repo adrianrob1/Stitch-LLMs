@@ -107,6 +107,7 @@ class GPTConfig:
     stitching_layer: int = 0 # layer to stitch
     stitch_bias: bool = True # bias in stitching layer
     freeze_non_stitching: bool = True # freeze non-stitching layers
+    use_original_head: bool = False # use original head instead of the second model's head
 
 class StitchingLayer(nn.Module):
     """Stitching layer for the Frankenstein model"""
