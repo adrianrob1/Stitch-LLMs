@@ -4,7 +4,7 @@
 
 out_dir = 'out-gpt2'
 wandb_log = True
-wandb_project = 'gpt2-backward'
+wandb_project = 'gpt2-owt'
 wandb_run_name='gpt2-124M-forward'
 backward = False
 

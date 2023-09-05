@@ -1,7 +1,7 @@
 
 out_dir = 'out-gpt2-backward'
 wandb_log = True # override via command line if you like
-wandb_project = 'gpt2-backward'
+wandb_project = 'gpt2-backward-large'
 wandb_run_name = 'mini-gpt'
 backward = True
 
