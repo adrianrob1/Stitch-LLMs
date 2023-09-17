@@ -1,0 +1,7 @@
+"Name","val/loss","train/loss"
+"gpt2-owt-learn-stitch-l_3-adamw-adam-adamw_h","4.846613883972168","4.837621688842773"
+"gpt2-owt-learn-stitch-l_6-adamw-adam-adamw_h","4.397524833679199","4.390217304229736"
+"gpt2-owt-learn-stitch-l_11-adamw-adam-adamw_h","3.3532607555389404","3.3433916568756104"
+"gpt2-owt-learn-stitch-l_11-adamw-adam","5.5167951583862305","5.499719619750977"
+"gpt2-owt-learn-stitch-l_6-adamw-adam","5.4560041427612305","5.4426374435424805"
+"gpt2-owt-learn-stitch-l_3-adamw-adam","5.431743621826172","5.420831680297852"

@@ -42,6 +42,7 @@ merge_weights = json.load(open('merge_weights_char.json'))
 
 stitch_layer_index = 5
 use_original_head = False
+use_original_wpe_wte = True
 
 eval_interval = 2000
 log_interval = 1
@@ -57,6 +58,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size_alignment = 8 # for stitching, we need to align the features using the stitching layer
 block_size = 1024
 # model
 n_layer = 12
@@ -65,7 +67,7 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+learning_rate = 1e-3 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -164,7 +166,7 @@ print("device", device)
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+torch.manual_seed(1339 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -177,7 +179,7 @@ data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-def get_batch(split):
+def get_batch(split, batch_size=batch_size):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
 
@@ -212,7 +214,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, stitching=(init_from == "stitch"), stitching_layer=stitch_layer_index, use_original_head=use_original_head) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, stitching=(init_from == "stitch"), stitching_layer=stitch_layer_index, use_original_head=use_original_head, use_original_wpe_wte=use_original_wpe_wte) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -279,18 +281,37 @@ elif init_from == 'merge':
             merge_state_dict[k[len(unwanted_prefix):]] = merge_state_dict.pop(k)
 
     # merge the models with a weighted average
-    for k,v in list(state_dict.items()):
+    '''
+        for k,v in list(state_dict.items()):
         merge_weight = merge_weights[k]
         print(f"merging {k} with weight {merge_weight}")
         state_dict[k] = state_dict[k] * (1-merge_weight) + merge_state_dict[k] * merge_weight
+    '''
+
+    # merge the model weights based on stitch_layer_index
+    # transformer.h.i.ln_1.weight -> get number i and compare to stitch_layer_index
+    for k,v in list(state_dict.items()):
+        if k.startswith('transformer.h'):
+            # get the layer number
+            layer_num = int(k.split('.')[2])
+            if layer_num >= stitch_layer_index:
+                # stitch the weights
+                state_dict[k] = merge_state_dict[k]
+            print(f"Copying layer {k} from second model: {layer_num >= stitch_layer_index}")
+        elif (k.startswith('transformer.ln_f') or k.startswith('lm_head')) and not gptconf.use_original_head:
+            # copy the final layer weights
+            state_dict[k] = merge_state_dict[k]
+            print(f"Copying layer {k} from second model")
+        elif(k.startswith('transformer.wpe') or k.startswith('transformer.wte')) and not gptconf.use_original_wpe_wte:
+            # copy the wpe and wte weights
+            state_dict[k] = merge_state_dict[k]
+            print(f"Copying layer {k} from second model")
 
     # free up some memory
     del merge_state_dict
     del merge_model_checkpoint
 
     model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
 
 elif init_from == 'stitch':
     print(f"Stitching model {resume_dir} with {merge_dir}")
@@ -330,7 +351,7 @@ elif init_from == 'stitch':
     model.load_state_dict(state_dict, strict=False)
 
     # get first batch of data
-    X, _ = get_batch('train')
+    X, _ = get_batch('train', batch_size=batch_size_alignment)
 
     # get the embeddings from the first model
     x_source = model.extract_features(X, stitch_layer_index)
@@ -364,6 +385,11 @@ elif init_from == 'stitch':
 
     # initialize the stitching layer
     model.init_stitching(x_source, x_target)
+
+    # free up some memory
+    x_source = None
+    x_target = None
+    torch.cuda.empty_cache()
 
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")

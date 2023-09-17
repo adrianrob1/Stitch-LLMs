@@ -108,6 +108,7 @@ class GPTConfig:
     stitch_bias: bool = True # bias in stitching layer
     freeze_non_stitching: bool = True # freeze non-stitching layers
     use_original_head: bool = False # use original head instead of the second model's head
+    use_original_wpe_wte: bool = True # use original wpe and wte instead of the second model's wpe and wte
 
 class StitchingLayer(nn.Module):
     """Stitching layer for the Frankenstein model"""
@@ -272,9 +273,13 @@ class StitchableGPT(nn.Module):
 
     def extract_features(self, x, block_idx):
         """Extract features from the model at the specified block index"""
-        x_e = self.transformer.wte(x)
-        x_pos = self.transformer.wpe(x)
-        x = self.transformer.drop(x_e + x_pos)
+        b, t = x.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=x.device).unsqueeze(0) # shape (1, t)
+
+        x = self.transformer.wte(x)
+        pos = self.transformer.wpe(pos)
+        x = self.transformer.drop(x + pos)
         for i, block in enumerate(self.transformer.h):
             if(self.config.stitching and i == self.config.stitching_layer):
                 x = self.transformer.stitching(x)
@@ -449,10 +454,13 @@ class StitchableGPT(nn.Module):
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
         # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
-        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters) # False
-        print(f"using fused AdamW: {use_fused}")
+        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.Adam).parameters)
+        #use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+        use_fused = False
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer =  torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args) # torch.optim.SGD(optim_groups, lr=learning_rate, momentum=0.9, **extra_args)
+        #optimizer = torch.optim.Adam(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = torch.optim.SGD(optim_groups, lr=learning_rate, momentum=0.9, **extra_args)
+        #optimizer =  torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
 
         return optimizer
 

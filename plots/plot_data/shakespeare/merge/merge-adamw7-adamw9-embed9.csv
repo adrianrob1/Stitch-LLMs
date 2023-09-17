@@ -1,0 +1,6 @@
+"Name","val/loss","use_original_wpe_wte"
+"gpt2-shakespeare-l5-adamw7-adamw9-fix_embed","6.358596324920654","false"
+"gpt2-shakespeare-l4-adamw7-adamw9-fix_embed","4.779567718505859","false"
+"gpt2-shakespeare-l3-adamw7-adamw9-fix_embed","4.849536895751953","false"
+"gpt2-shakespeare-l2-adamw7-adamw9-fix_embed","5.865062236785889","false"
+"gpt2-shakespeare-l1-adamw7-adamw9-fix_embed","5.744704723358154","false"

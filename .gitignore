@@ -12,3 +12,4 @@ out*
 checkpoints.tar.xz
 stitched*
 gpt2-fw*
+gpt2-owt*
