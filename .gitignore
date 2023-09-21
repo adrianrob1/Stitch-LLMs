@@ -2,7 +2,8 @@
 .ipynb_checkpoints/
 __pycache__/
 *.pyc
-data
+train.bin
+val.bin
 out-shakespeare-backward
 out-shakespeare
 out-shakespeare-char-mod
