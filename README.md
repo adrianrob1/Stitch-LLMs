@@ -28,14 +28,14 @@ Dependencies:
 python3 ./train.py ./config/train_gpt2.py
 
 ### Merge models
-Merge model from merge_dir into model from resume_dir at stitch_layer_index i
-We can choose whether to preserve the original head or not
+Merge model from merge_dir into model from resume_dir at stitch_layer_index i.   
+We can choose whether to preserve the original head or not.
 
 python3 ./train.py ./config/train_gpt2.py --out_dir=out --resume_dir=gpt2-fw-adam-1337 --merge_dir=gpt2-fw-sgd-1337 --wandb_run_name=gpt2-owt-l_$i-adam-sgd-adam_h --init_from=merge --stitch_layer_index=$i --eval_interval=200 --eval_iters=200 --use_original_head=True --eval_only=True
 
 ### Stitch models
-Stitch model from merge_dir into model from resume_dir at stitch_layer_index i
-We can choose whether to preserve the original head or not
+Stitch model from merge_dir into model from resume_dir at stitch_layer_index i.   
+We can choose whether to preserve the original head or not.
 
 python3 ./train.py ./config/train_gpt2.py --out_dir=out --resume_dir=gpt2-fw-adam-1337 --merge_dir=gpt2-fw-sgd-1337 --wandb_run_name=gpt2-owt-l_$i-adam-sgd-adam_h --init_from=merge --stitch_layer_index=$i --eval_interval=200 --eval_iters=200 --use_original_head=True
 ### Sample
