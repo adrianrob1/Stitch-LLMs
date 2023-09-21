@@ -1,3 +1,4 @@
+This project wouldn't have been possible without [nanoGPT](https://github.com/karpathy/nanoGPT).
 
 # nanoGPT
 
@@ -23,15 +24,19 @@ Dependencies:
 
 ## quick start
 
-### Train Forward
+### Train Model
 python3 ./train.py ./config/train_gpt2.py
 
-## Train Backward
-./train.py ./config/train_gpt2_backward.py
+### Merge models
+Merge model from merge_dir into model from resume_dir at stitch_layer_index i
+We can choose whether to preserve the original head or not
 
-### Merge weights
-python3 ./train.py ./config/train_gpt2_backward.py --resume_dir=out-gpt2-backward-5.2k --merge_dir=out-gpt2-forward-5.2k --wandb_run_name=gpt2-merge-test-10 --init_from=merge --eval_only=True
+python3 ./train.py ./config/train_gpt2.py --out_dir=out --resume_dir=gpt2-fw-adam-1337 --merge_dir=gpt2-fw-sgd-1337 --wandb_run_name=gpt2-owt-l_$i-adam-sgd-adam_h --init_from=merge --stitch_layer_index=$i --eval_interval=200 --eval_iters=200 --use_original_head=True --eval_only=True
 
+### Stitch models
+Stitch model from merge_dir into model from resume_dir at stitch_layer_index i
+We can choose whether to preserve the original head or not
+
+python3 ./train.py ./config/train_gpt2.py --out_dir=out --resume_dir=gpt2-fw-adam-1337 --merge_dir=gpt2-fw-sgd-1337 --wandb_run_name=gpt2-owt-l_$i-adam-sgd-adam_h --init_from=merge --stitch_layer_index=$i --eval_interval=200 --eval_iters=200 --use_original_head=True
 ### Sample
 python3 ./sample.py --out_dir=out-gpt2-backward
-
